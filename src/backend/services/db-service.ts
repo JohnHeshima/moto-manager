@@ -638,6 +638,138 @@ export const addPaymentRange = async ({
     }
 };
 
+export const updatePaymentRange = async ({
+    paymentId,
+    totalAmount,
+    targetAmount,
+    ownerSignature,
+    driverSignature,
+    driverId,
+    driverName,
+    reason,
+    startDate,
+    endDate,
+}: {
+    paymentId: string;
+    totalAmount: number;
+    targetAmount: number;
+    ownerSignature: string;
+    driverSignature: string;
+    driverId: string;
+    driverName: string;
+    reason?: string;
+    startDate: Date;
+    endDate: Date;
+}) => {
+    try {
+        await requireManagerAccess();
+
+        const paymentRef = doc(db, PAYMENTS_COLLECTION, paymentId);
+        const paymentSnapshot = await getDoc(paymentRef);
+
+        if (!paymentSnapshot.exists()) {
+            throw new Error("Paiement introuvable.");
+        }
+
+        const paymentData = paymentSnapshot.data() as Payment;
+
+        if (paymentData.paymentType !== "range_parent") {
+            throw new Error("Seuls les paiements par lot peuvent etre redecoupes.");
+        }
+
+        const paymentPlan = buildPaymentRangePlan({
+            startDate,
+            endDate,
+            totalAmount,
+            targetAmount,
+        });
+
+        if (!paymentPlan.isValid) {
+            throw new Error(paymentPlan.validationMessage || "Intervalle de paiement invalide.");
+        }
+
+        const childPaymentsSnapshot = await getDocs(
+            query(collection(db, PAYMENTS_COLLECTION), where("parentPaymentId", "==", paymentId))
+        );
+
+        const intervalGroupId = typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : `range-update-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const paymentsCollection = collection(db, PAYMENTS_COLLECTION);
+        const periodStartTimestamp = Timestamp.fromDate(startDate);
+        const periodEndTimestamp = Timestamp.fromDate(endDate);
+        const createdAt = (paymentSnapshot.data().createdAt as Timestamp | undefined) || Timestamp.now();
+        const parentTargetAmount = paymentPlan.weekCount * targetAmount;
+        const parentShortfall = Math.max(0, parentTargetAmount - totalAmount);
+        const parentStatus = getPaymentStatus(totalAmount, parentTargetAmount);
+        const batch = writeBatch(db);
+        const deletedAt = Timestamp.now();
+
+        batch.update(paymentRef, {
+            amount: totalAmount,
+            targetAmount: parentTargetAmount,
+            shortfall: parentShortfall,
+            status: parentStatus,
+            date: periodStartTimestamp,
+            weekStart: Timestamp.fromDate(getWeekStartDate(startDate)),
+            ownerSignature,
+            driverSignature,
+            driverId,
+            driverName,
+            reason: reason || null,
+            periodStart: periodStartTimestamp,
+            periodEnd: periodEndTimestamp,
+            allocationCount: paymentPlan.weekCount,
+            intervalGroupId,
+            regularizationType: null,
+            regularizedSurplus: null,
+            carriedSurplus: null,
+            updatedAt: deletedAt,
+        });
+
+        childPaymentsSnapshot.docs.forEach((childDoc) => {
+            batch.update(childDoc.ref, {
+                isDeleted: true,
+                deletedAt,
+                deletedBy: auth.currentUser?.uid || "system",
+            });
+        });
+
+        paymentPlan.allocations.forEach((allocation) => {
+            const status = getPaymentStatus(allocation.amount, allocation.targetAmount);
+            const childPaymentRef = doc(paymentsCollection);
+
+            batch.set(childPaymentRef, {
+                paymentType: "range_item",
+                parentPaymentId: paymentId,
+                amount: allocation.amount,
+                targetAmount: allocation.targetAmount,
+                shortfall: allocation.shortfall,
+                status,
+                date: Timestamp.fromDate(allocation.startDate),
+                weekStart: Timestamp.fromDate(allocation.weekStart),
+                ownerSignature,
+                driverSignature,
+                driverId,
+                driverName,
+                reason: allocation.index === paymentPlan.weekCount ? (reason || null) : null,
+                periodStart: periodStartTimestamp,
+                periodEnd: periodEndTimestamp,
+                allocationIndex: allocation.index,
+                allocationCount: paymentPlan.weekCount,
+                intervalGroupId,
+                createdAt,
+            });
+        });
+
+        await batch.commit();
+        return true;
+    } catch (error) {
+        console.error("Error updating payment range:", error);
+        return false;
+    }
+};
+
 export const regularizePaymentSurplus = async ({
     paymentId,
 }: {

@@ -9,7 +9,7 @@ import { Label } from "@/frontend/components/ui/label";
 import SignaturePad, { SignaturePadRef } from "@/frontend/components/SignaturePad";
 import { Loader2, Check } from "lucide-react";
 import { cn } from "@/shared/lib/utils";
-import { addPayment, addPaymentRange, updatePayment } from "@/backend/services/db-service";
+import { addPayment, addPaymentRange, updatePayment, updatePaymentRange } from "@/backend/services/db-service";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/frontend/components/ui/select";
 import { useAuth } from "@/frontend/contexts/AuthContext";
 import { formatAmount } from "@/shared/lib/format";
@@ -41,6 +41,7 @@ function getInitialPaymentType(payment?: Payment | null): PaymentType {
 export default function PaymentForm({ onSuccess, initialData, drivers = [] }: PaymentFormProps) {
     const { user, userProfile } = useAuth();
     const isEditing = Boolean(initialData?.id);
+    const isEditingRange = initialData?.paymentType === "range_parent";
     const isAdmin = userProfile?.role === 'admin' || userProfile?.role === 'co_manager';
     const [paymentType, setPaymentType] = useState<PaymentType>(getInitialPaymentType(initialData));
     const [amount, setAmount] = useState<string>(initialData?.amount?.toString() || "");
@@ -56,7 +57,7 @@ export default function PaymentForm({ onSuccess, initialData, drivers = [] }: Pa
     const ownerSigRef = useRef<SignaturePadRef>(null);
     const driverSigRef = useRef<SignaturePadRef>(null);
 
-    const activePaymentType = isEditing ? "weekly" : paymentType;
+    const activePaymentType = isEditingRange ? "range" : isEditing ? "weekly" : paymentType;
     const amountNum = parseInt(amount || "0");
     const shortfall = Math.max(0, TARGET_AMOUNT - amountNum);
     const isFull = amountNum >= TARGET_AMOUNT;
@@ -121,10 +122,22 @@ export default function PaymentForm({ onSuccess, initialData, drivers = [] }: Pa
         let success;
 
         if (initialData?.id) {
-            // Update currently doesn't support date change in db-service, assume strictly for creation now or ignore.
-            // If we want to support editing date, we need to update db-service too.
-            // For now, MVP: only new payments support backdating.
-            success = await updatePayment(initialData.id, amountNum, TARGET_AMOUNT, ownerSig, driverSig, reason);
+            if (isEditingRange) {
+                success = await updatePaymentRange({
+                    paymentId: initialData.id,
+                    totalAmount: amountNum,
+                    targetAmount: TARGET_AMOUNT,
+                    ownerSignature: ownerSig,
+                    driverSignature: driverSig,
+                    driverId: finalDriverId,
+                    driverName,
+                    reason,
+                    startDate: new Date(`${rangeStartDate}T12:00:00`),
+                    endDate: new Date(`${rangeEndDate}T12:00:00`),
+                });
+            } else {
+                success = await updatePayment(initialData.id, amountNum, TARGET_AMOUNT, ownerSig, driverSig, reason);
+            }
         } else {
             if (activePaymentType === "range") {
                 success = await addPaymentRange({
@@ -211,6 +224,12 @@ export default function PaymentForm({ onSuccess, initialData, drivers = [] }: Pa
                 </div>
             )}
 
+            {isEditingRange && (
+                <div className="rounded-[26px] border border-primary/20 bg-primary/10 px-4 py-3 text-sm text-foreground">
+                    Tu modifies un lot deja cree. La nouvelle plage remplacera tous les sous-montants actuels par un nouveau decoupage.
+                </div>
+            )}
+
             {activePaymentType === "weekly" ? (
                 <div className="space-y-2">
                     <Label htmlFor="date" className="text-base font-semibold text-foreground pl-1">Date du Versement</Label>
@@ -288,7 +307,7 @@ export default function PaymentForm({ onSuccess, initialData, drivers = [] }: Pa
                     </div>
                     <div className="flex justify-between items-center px-1">
                         <span className="text-xs text-muted-foreground font-medium">
-                            {activePaymentType === "range" ? "Base par semaine" : "Objectif journalier"}: <strong>{formatAmount(TARGET_AMOUNT)} FC</strong>
+                            {activePaymentType === "range" ? "Base par semaine" : "Objectif hebdomadaire"}: <strong>{formatAmount(TARGET_AMOUNT)} FC</strong>
                         </span>
 
                         {amountNum > 0 && (
@@ -410,7 +429,7 @@ export default function PaymentForm({ onSuccess, initialData, drivers = [] }: Pa
                     </>
                 ) : (
                     <>
-                        <Check className="mr-2 h-6 w-6" /> {initialData ? "Mettre à jour" : activePaymentType === "range" ? "Créer le lot de paiements" : "Confirmer le Versement"}
+                        <Check className="mr-2 h-6 w-6" /> {initialData ? (isEditingRange ? "Recalculer le lot" : "Mettre à jour") : activePaymentType === "range" ? "Créer le lot de paiements" : "Confirmer le Versement"}
                     </>
                 )}
             </Button>

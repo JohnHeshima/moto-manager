@@ -18,7 +18,7 @@ import { DriverOption, Payment } from "@/shared/types";
 import { useAuth } from "@/frontend/contexts/AuthContext";
 import { useRouter } from "next/navigation";
 
-import { collection, getDocs, query } from "firebase/firestore";
+import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from "@/backend/firebase/firebase";
 
 type AppTab = "dashboard" | "history" | "new" | "details" | "edit" | "stats" | "documents" | "settings";
@@ -61,7 +61,7 @@ export default function Home() {
 
     const fetchDrivers = async () => {
       try {
-        const userQuery = query(collection(db, "users"));
+        const userQuery = query(collection(db, "users"), where("role", "==", "driver"));
         const snap = await getDocs(userQuery);
         const driverOptions = snap.docs
           .map((driverDoc) => {

@@ -534,15 +534,9 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                     >
                         {isDeleting ? <span className="animate-spin">...</span> : <Trash2 className="h-6 w-6" />}
                     </Button>
-                    {isRangeParent ? (
-                        <Button variant="outline" size="lg" disabled className="flex-1 text-lg h-14 rounded-2xl shadow-lg border-dashed opacity-70">
-                            Lot non modifiable
-                        </Button>
-                    ) : (
-                        <Button onClick={onEdit} size="lg" className="flex-1 text-lg h-14 rounded-2xl shadow-lg shadow-primary/20 font-bold">
-                            <Edit2 className="mr-2 h-5 w-5" /> Modifier
-                        </Button>
-                    )}
+                    <Button onClick={onEdit} size="lg" className="flex-1 text-lg h-14 rounded-2xl shadow-lg shadow-primary/20 font-bold">
+                        <Edit2 className="mr-2 h-5 w-5" /> {isRangeParent ? "Modifier le lot" : "Modifier"}
+                    </Button>
                 </div>
             ) : (
                 /* Driver View - No Edit Button */

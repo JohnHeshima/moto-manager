@@ -11,9 +11,14 @@ import { Label } from "@/frontend/components/ui/label";
 import { ArrowLeft, Edit2, Calendar, Banknote, AlertTriangle, Trash2, Clock, MessageSquare, Send, PenTool, Layers3, Loader2, WandSparkles } from "lucide-react";
 import { cn } from "@/shared/lib/utils";
 import { useAuth } from "@/frontend/contexts/AuthContext";
-import { deletePayment, addPaymentComment, updateDriverSignature, subscribeToPayment, subscribeToChildPayments, convertPaymentToRange } from "@/backend/services/db-service";
+import { deletePayment, addPaymentComment, updateDriverSignature, subscribeToPayment, subscribeToChildPayments, regularizePaymentSurplus } from "@/backend/services/db-service";
 import SignaturePad, { SignaturePadRef } from "@/frontend/components/SignaturePad";
 import { formatAmount } from "@/shared/lib/format";
+import {
+    SURPLUS_REGULARIZATION_THRESHOLD,
+    buildSurplusRegularizationPlan,
+    shouldRegularizeWeeklySurplus,
+} from "@/shared/lib/payment-allocation";
 
 interface PaymentDetailsProps {
     payment: Payment;
@@ -42,8 +47,6 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
     const [childPayments, setChildPayments] = useState<Payment[]>([]);
     const [isConvertOpen, setIsConvertOpen] = useState(false);
     const [isConverting, setIsConverting] = useState(false);
-    const [convertStartDate, setConvertStartDate] = useState(format(payment.weekStart || payment.date, "yyyy-MM-dd"));
-    const [convertEndDate, setConvertEndDate] = useState(format(payment.date, "yyyy-MM-dd"));
     const sigRef = useRef<SignaturePadRef>(null);
 
     // Subscribe to real-time updates for this specific payment
@@ -62,9 +65,9 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
             return;
         }
 
-        const unsubscribe = subscribeToChildPayments(currentPayment.id, setChildPayments);
+        const unsubscribe = subscribeToChildPayments(currentPayment.id, setChildPayments, user?.uid, userProfile?.role);
         return () => unsubscribe();
-    }, [currentPayment.id, currentPayment.paymentType]);
+    }, [currentPayment.id, currentPayment.paymentType, user?.uid, userProfile?.role]);
 
 
     const handleDelete = async () => {
@@ -82,7 +85,7 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
     };
 
     const handleAddComment = async () => {
-        if (!newComment.trim() || !user || !currentPayment.id) return;
+        if (!canCommentOnPayment || !newComment.trim() || !user || !currentPayment.id) return;
 
         const success = await addPaymentComment(currentPayment.id, {
             text: newComment,
@@ -96,7 +99,7 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
     };
 
     const handleSign = async () => {
-        if (sigRef.current?.isEmpty() || !currentPayment.id) return;
+        if (!canSignCurrentPayment || sigRef.current?.isEmpty() || !currentPayment.id) return;
         const signature = sigRef.current?.toDataURL();
         if (signature) {
             await updateDriverSignature(currentPayment.id, signature);
@@ -109,10 +112,32 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
         && currentPayment.createdAt
         && !isSameWeek(currentPayment.date, currentPayment.createdAt, { weekStartsOn: 1 });
     const isRangeParent = currentPayment.paymentType === "range_parent";
+    const canManagePayment = userProfile?.role === 'admin' || userProfile?.role === 'co_manager';
+    const isDriverReadonlyView = userProfile?.role === "driver";
+    const canCommentOnPayment = canManagePayment || (userProfile?.role === "driver" && currentPayment.driverId === user?.uid);
+    const canSignCurrentPayment = userProfile?.role === 'driver'
+        && currentPayment.driverId === user?.uid
+        && !currentPayment.driverSignature;
+    const currentSurplus = Math.max(0, currentPayment.amount - currentPayment.targetAmount);
     const canConvertLegacyPayment = !isRangeParent
         && (currentPayment.paymentType === "weekly" || !currentPayment.paymentType)
-        && currentPayment.amount > currentPayment.targetAmount;
+        && shouldRegularizeWeeklySurplus({
+            amount: currentPayment.amount,
+            targetAmount: currentPayment.targetAmount,
+        });
+    const regularizationPlan = canConvertLegacyPayment
+        ? buildSurplusRegularizationPlan({
+            startDate: currentPayment.weekStart || currentPayment.date,
+            totalAmount: currentPayment.amount,
+            targetAmount: currentPayment.targetAmount,
+        })
+        : null;
     const displayedChildPayments = isRangeParent ? childPayments : [];
+    const statusLabel = currentPayment.status === "excess"
+        ? "Surplus"
+        : currentPayment.status === "full"
+            ? "Complet"
+            : "Incomplet";
 
     const sortedComments = [...(currentPayment.comments || [])].sort((a, b) =>
         coerceDate(b.createdAt).getTime() - coerceDate(a.createdAt).getTime()
@@ -124,10 +149,8 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
         }
 
         setIsConverting(true);
-        const success = await convertPaymentToRange({
+        const success = await regularizePaymentSurplus({
             paymentId: currentPayment.id,
-            startDate: new Date(`${convertStartDate}T12:00:00`),
-            endDate: new Date(`${convertEndDate}T12:00:00`),
         });
 
         setIsConverting(false);
@@ -135,7 +158,7 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
         if (success) {
             setIsConvertOpen(false);
         } else {
-            alert("Impossible de convertir ce paiement en lot pour l'instant.");
+            alert("Impossible de regulariser ce surplus pour l'instant.");
         }
     };
 
@@ -151,7 +174,11 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
             <Card className="border-border/50 shadow-md overflow-hidden">
                 <div className={cn(
                     "h-2 w-full",
-                    currentPayment.status === 'full' ? "bg-primary" : "bg-foreground"
+                    currentPayment.status === "full"
+                        ? "bg-primary"
+                        : currentPayment.status === "excess"
+                            ? "bg-emerald-500"
+                            : "bg-foreground"
                 )} />
                 <CardHeader className="pb-4">
                     <div className="flex justify-between items-start">
@@ -164,15 +191,23 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                         </div>
                         <div className={cn(
                             "px-3 py-1 rounded-full text-xs font-bold border",
-                            currentPayment.status === 'full'
+                            currentPayment.status === "full"
                                 ? "border-primary/30 bg-primary/18 text-foreground"
-                                : "border-black/10 bg-secondary text-foreground/75"
+                                : currentPayment.status === "excess"
+                                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                    : "border-black/10 bg-secondary text-foreground/75"
                         )}>
-                            {currentPayment.status === 'full' ? "Complet" : "Incomplet"}
+                            {statusLabel}
                         </div>
                     </div>
                 </CardHeader>
                 <CardContent className="space-y-6">
+                    {isDriverReadonlyView && (
+                        <div className="rounded-2xl border border-black/8 bg-secondary/55 px-4 py-3 text-sm text-muted-foreground">
+                            Ce versement est en lecture seule. Le motard peut seulement ajouter un commentaire et sa signature.
+                        </div>
+                    )}
+
                     <div className="grid grid-cols-2 gap-4">
                         {isRegularization ? (
                             <>
@@ -277,6 +312,29 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                         </div>
                     )}
 
+                    {currentPayment.regularizationType === "surplus_spread" && (
+                        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+                            Ce paiement a ete regularise automatiquement sur {currentPayment.allocationCount || 0} semaines consecutives.
+                            {typeof currentPayment.regularizedSurplus === "number" && (
+                                <span className="font-semibold"> Surplus initial traite: {formatAmount(currentPayment.regularizedSurplus)} FC.</span>
+                            )}
+                        </div>
+                    )}
+
+                    {currentSurplus > 0 && (
+                        <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 space-y-2">
+                            <div className="flex items-center gap-2 font-bold text-emerald-800">
+                                <AlertTriangle className="h-4 w-4" />
+                                Surplus constate: {formatAmount(currentSurplus)} FC
+                            </div>
+                            <p className="text-sm text-emerald-800/80">
+                                {canConvertLegacyPayment
+                                    ? `Ce surplus depasse le plafond de ${formatAmount(SURPLUS_REGULARIZATION_THRESHOLD)} FC pour une seule semaine. Une regularisation sur les semaines suivantes est recommandee.`
+                                    : "Ce surplus reste dans la marge autorisee pour une seule semaine."}
+                            </p>
+                        </div>
+                    )}
+
                     {currentPayment.shortfall > 0 && (
                         <div className="rounded-xl border border-primary/20 bg-primary/10 p-4 space-y-3">
                             <div className="flex items-center gap-2 font-bold text-foreground">
@@ -291,13 +349,13 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                         </div>
                     )}
 
-                    {canConvertLegacyPayment && (
+                    {canManagePayment && canConvertLegacyPayment && (
                         <div className="space-y-3 rounded-[24px] border border-black/8 bg-card p-4">
                             <div className="flex items-start justify-between gap-4">
                                 <div>
-                                    <p className="text-sm font-bold text-foreground">Convertir cet ancien gros paiement en lot</p>
+                                    <p className="text-sm font-bold text-foreground">Regulariser ce surplus automatiquement</p>
                                     <p className="mt-1 text-xs text-muted-foreground">
-                                        Cette opération garde ce paiement comme trace principale, puis crée les sous-montants subdivisés par semaine.
+                                        Cette operation garde ce paiement comme trace principale, puis repartit automatiquement le surplus sur les semaines suivantes.
                                     </p>
                                 </div>
                                 <Button
@@ -307,37 +365,59 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                                     onClick={() => setIsConvertOpen((open) => !open)}
                                 >
                                     <WandSparkles className="mr-2 h-4 w-4" />
-                                    {isConvertOpen ? "Fermer" : "Convertir"}
+                                    {isConvertOpen ? "Fermer" : "Voir la regularisation"}
                                 </Button>
                             </div>
 
-                            {isConvertOpen && (
-                                <div className="grid gap-4 rounded-2xl border border-black/8 bg-background/70 p-4 sm:grid-cols-2">
-                                    <div className="space-y-2">
-                                        <Label htmlFor="convert-start">Date de début</Label>
-                                        <Input
-                                            id="convert-start"
-                                            type="date"
-                                            value={convertStartDate}
-                                            onChange={(e) => setConvertStartDate(e.target.value)}
-                                        />
+                            {isConvertOpen && regularizationPlan && (
+                                <div className="space-y-4 rounded-2xl border border-black/8 bg-background/70 p-4">
+                                    <div className="grid gap-3 sm:grid-cols-3">
+                                        <div className="rounded-2xl border border-black/8 bg-card px-4 py-3">
+                                            <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Surplus initial</p>
+                                            <p className="mt-2 text-lg font-bold text-foreground">{formatAmount(regularizationPlan.sourceSurplus)} FC</p>
+                                        </div>
+                                        <div className="rounded-2xl border border-black/8 bg-card px-4 py-3">
+                                            <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Semaines couvrees</p>
+                                            <p className="mt-2 text-lg font-bold text-foreground">{regularizationPlan.weekCount}</p>
+                                            <p className="text-xs text-muted-foreground">
+                                                Du {format(regularizationPlan.periodStart, "d MMM", { locale: fr })} au {format(regularizationPlan.periodEnd, "d MMM yyyy", { locale: fr })}
+                                            </p>
+                                        </div>
+                                        <div className="rounded-2xl border border-black/8 bg-card px-4 py-3">
+                                            <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Surplus final conserve</p>
+                                            <p className="mt-2 text-lg font-bold text-foreground">{formatAmount(regularizationPlan.carriedSurplus)} FC</p>
+                                            <p className="text-xs text-muted-foreground">Toujours inferieur au plafond hebdomadaire.</p>
+                                        </div>
                                     </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="convert-end">Date de fin</Label>
-                                        <Input
-                                            id="convert-end"
-                                            type="date"
-                                            value={convertEndDate}
-                                            onChange={(e) => setConvertEndDate(e.target.value)}
-                                        />
+
+                                    <div className="space-y-2 rounded-2xl border border-black/8 bg-card p-3">
+                                        {regularizationPlan.allocations.map((allocation) => (
+                                            <div key={allocation.index} className="flex items-center justify-between gap-3 rounded-xl bg-background/80 px-3 py-2">
+                                                <div>
+                                                    <p className="text-sm font-bold text-foreground">Semaine {allocation.index}</p>
+                                                    <p className="text-xs text-muted-foreground">
+                                                        {format(allocation.startDate, "d MMM", { locale: fr })} au {format(allocation.endDate, "d MMM yyyy", { locale: fr })}
+                                                    </p>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="text-sm font-bold text-foreground">{formatAmount(allocation.amount)} FC</p>
+                                                    <p className="text-xs text-muted-foreground">
+                                                        {allocation.surplus > 0
+                                                            ? `Surplus final: ${formatAmount(allocation.surplus)} FC`
+                                                            : "Objectif couvert"}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        ))}
                                     </div>
-                                    <div className="sm:col-span-2 flex items-center justify-between gap-3 rounded-xl bg-secondary/70 px-3 py-3">
+
+                                    <div className="flex items-center justify-between gap-3 rounded-xl bg-secondary/70 px-3 py-3">
                                         <p className="text-xs text-muted-foreground">
-                                            Montant principal conservé: <span className="font-bold text-foreground">{formatAmount(currentPayment.amount)} FC</span>
+                                            Le paiement principal est conserve, puis le surplus est ventile sur les semaines suivantes.
                                         </p>
                                         <Button type="button" onClick={handleConvertToRange} disabled={isConverting}>
                                             {isConverting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                                            Valider la conversion
+                                            Appliquer la regularisation
                                         </Button>
                                     </div>
                                 </div>
@@ -350,7 +430,7 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                         <div className="flex justify-between items-center">
                             <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Signature Motard</Label>
                             {/* Allow driver to sign if missing */}
-                            {userProfile?.role === 'driver' && !currentPayment.driverSignature && !isSigning && (
+                            {canSignCurrentPayment && !isSigning && (
                                 <Button variant="outline" size="sm" onClick={() => setIsSigning(true)} className="h-7 text-xs">
                                     <PenTool className="h-3 w-3 mr-1" /> Signer
                                 </Button>
@@ -422,22 +502,28 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
                             )}
                         </div>
 
-                        <div className="flex gap-2">
-                            <Input
-                                placeholder="Ajouter une observation..."
-                                value={newComment}
-                                onChange={(e) => setNewComment(e.target.value)}
-                                className="h-9 text-sm"
-                            />
-                            <Button size="icon" className="h-9 w-9 shrink-0" onClick={handleAddComment} disabled={!newComment.trim()}>
-                                <Send className="h-4 w-4" />
-                            </Button>
-                        </div>
+                        {canCommentOnPayment ? (
+                            <div className="flex gap-2">
+                                <Input
+                                    placeholder={canManagePayment ? "Ajouter une observation..." : "Ajouter un commentaire..."}
+                                    value={newComment}
+                                    onChange={(e) => setNewComment(e.target.value)}
+                                    className="h-9 text-sm"
+                                />
+                                <Button size="icon" className="h-9 w-9 shrink-0" onClick={handleAddComment} disabled={!newComment.trim()}>
+                                    <Send className="h-4 w-4" />
+                                </Button>
+                            </div>
+                        ) : (
+                            <p className="text-xs text-muted-foreground">
+                                Les commentaires sont indisponibles pour ce paiement.
+                            </p>
+                        )}
                     </div>
                 </CardContent>
             </Card>
 
-            {(userProfile?.role === 'admin' || userProfile?.role === 'co_manager') ? (
+            {canManagePayment ? (
                 <div className="flex gap-4">
                     <Button
                         variant="destructive"
@@ -461,7 +547,7 @@ export default function PaymentDetails({ payment, onEdit, onBack }: PaymentDetai
             ) : (
                 /* Driver View - No Edit Button */
                 <Button variant="outline" size="lg" disabled className="w-full text-lg h-14 rounded-2xl shadow-lg border-dashed opacity-70">
-                    Modification restreinte
+                    {canSignCurrentPayment || canCommentOnPayment ? "Commentaire et signature uniquement" : "Paiement verrouille"}
                 </Button>
             )}
         </div>

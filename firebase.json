@@ -1,8 +1,12 @@
 {
     "firestore": [
         {
+            "database": "driver-payment-manager",
+            "rules": "firestore.rules"
+        },
+        {
             "database": "driver-payment-manager-dev",
-            "rules": "firestore.dev.rules"
+            "rules": "firestore.rules"
         }
     ],
     "storage": {

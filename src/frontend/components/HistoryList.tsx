@@ -8,6 +8,7 @@ import { Payment } from "@/shared/types";
 import { subscribeToPayments } from "@/backend/services/db-service";
 import { cn } from "@/shared/lib/utils";
 import { formatAmount } from "@/shared/lib/format";
+import { shouldRegularizeWeeklySurplus } from "@/shared/lib/payment-allocation";
 
 export default function HistoryList({
     limit,
@@ -45,6 +46,17 @@ export default function HistoryList({
             )}
             {displayedPayments.map((payment) => {
                 const isRangeParent = payment.paymentType === "range_parent";
+                const isRegularizationCandidate = !isRangeParent
+                    && (payment.paymentType === "weekly" || !payment.paymentType)
+                    && shouldRegularizeWeeklySurplus({
+                        amount: payment.amount,
+                        targetAmount: payment.targetAmount,
+                    });
+                const statusLabel = payment.status === "excess"
+                    ? `Surplus: ${formatAmount(Math.max(0, payment.amount - payment.targetAmount))}`
+                    : payment.shortfall > 0
+                        ? `Reste: ${formatAmount(payment.shortfall)}`
+                        : "Complet";
 
                 return (
                     <div
@@ -82,6 +94,16 @@ export default function HistoryList({
                                             Paiement principal
                                         </span>
                                     )}
+                                    {isRegularizationCandidate && (
+                                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-700">
+                                            Regularisation conseillee
+                                        </span>
+                                    )}
+                                    {payment.regularizationType === "surplus_spread" && (
+                                        <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                                            Surplus aligne
+                                        </span>
+                                    )}
                                 </div>
                                 {payment.reason && (
                                     <p className="text-[10px] text-muted-foreground mt-1 italic max-w-[180px] truncate">
@@ -92,15 +114,16 @@ export default function HistoryList({
                         </div>
 
                         <div className="text-right flex flex-col items-end gap-1">
-                            {payment.shortfall > 0 ? (
-                                <p className="rounded-full bg-secondary px-2 py-0.5 text-xs font-bold text-foreground/75">
-                                    Reste: {formatAmount(payment.shortfall)}
-                                </p>
-                            ) : (
-                                <p className="rounded-full bg-primary/18 px-2 py-0.5 text-xs font-bold text-foreground">
-                                    Complet
-                                </p>
-                            )}
+                            <p className={cn(
+                                "rounded-full px-2 py-0.5 text-xs font-bold",
+                                payment.status === "excess"
+                                    ? "bg-emerald-100 text-emerald-700"
+                                    : payment.shortfall > 0
+                                        ? "bg-secondary text-foreground/75"
+                                        : "bg-primary/18 text-foreground"
+                            )}>
+                                {statusLabel}
+                            </p>
                         </div>
                     </div>
                 );

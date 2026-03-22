@@ -8,6 +8,7 @@ import { Button } from "@/frontend/components/ui/button";
 import { Card, CardHeader, CardTitle, CardContent } from "@/frontend/components/ui/card";
 
 export default function SetupPage() {
+    const setupEnabled = process.env.NEXT_PUBLIC_ENABLE_SETUP === "true";
     const [status, setStatus] = useState("");
     const [error, setError] = useState("");
 
@@ -39,6 +40,23 @@ export default function SetupPage() {
             setStatus("");
         }
     };
+
+    if (!setupEnabled) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-background p-4">
+                <Card className="w-full max-w-md">
+                    <CardHeader>
+                        <CardTitle>Initialisation désactivée</CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                        <p className="text-sm text-muted-foreground">
+                            Cette page est désactivée par défaut pour éviter toute initialisation non voulue en production.
+                        </p>
+                    </CardContent>
+                </Card>
+            </div>
+        );
+    }
 
     return (
         <div className="flex items-center justify-center min-h-screen bg-background p-4">

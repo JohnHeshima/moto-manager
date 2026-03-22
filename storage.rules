@@ -6,6 +6,14 @@ service firebase.storage {
       return request.auth != null;
     }
 
+    function isManager() {
+      return isSignedIn()
+        && (
+          request.auth.token.email == "admin@gmail.com"
+          || request.auth.token.email == "djumajadot6@gmail.com"
+        );
+    }
+
     function isAllowedDocument() {
       return request.resource != null
         && request.resource.size < 15 * 1024 * 1024
@@ -13,8 +21,8 @@ service firebase.storage {
     }
 
     match /driver-documents/{driverId}/{fileName} {
-      allow read: if isSignedIn();
-      allow write: if isSignedIn() && isAllowedDocument();
+      allow read: if isManager() || (isSignedIn() && request.auth.uid == driverId);
+      allow write: if isManager() && isAllowedDocument();
     }
   }
 }

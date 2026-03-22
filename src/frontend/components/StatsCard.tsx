@@ -23,11 +23,13 @@ export default function StatsCard({
     selectedDriverId,
     selectedDriverLabel,
     onDriverChange,
+    canSelectDriver = true,
 }: {
     drivers: DriverOption[];
     selectedDriverId: string;
     selectedDriverLabel: string;
     onDriverChange: (driverId: string) => void;
+    canSelectDriver?: boolean;
 }) {
     const [stats, setStats] = useState<WeeklyStats>(EMPTY_STATS);
 
@@ -45,7 +47,7 @@ export default function StatsCard({
     const displayedStats = selectedDriverId ? stats : EMPTY_STATS;
     const { currentWeek, career, global } = displayedStats;
     const isOnTrack = currentWeek.progress >= 100;
-    const showDriverSelect = drivers.length > 0;
+    const showDriverSelect = canSelectDriver && drivers.length > 0;
 
     return (
         <Card className="relative overflow-hidden border-none bg-foreground text-background shadow-[0_25px_60px_rgba(0,0,0,0.24)] ring-1 ring-black/10">

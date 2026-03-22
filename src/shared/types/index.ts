@@ -1,6 +1,7 @@
 export interface Payment {
     id?: string;
     paymentType?: "weekly" | "range" | "range_parent" | "range_item";
+    regularizationType?: "surplus_spread";
     amount: number;
     targetAmount: number;
     shortfall: number;
@@ -20,6 +21,8 @@ export interface Payment {
     allocationCount?: number;
     intervalGroupId?: string;
     parentPaymentId?: string;
+    regularizedSurplus?: number;
+    carriedSurplus?: number;
     comments?: Comment[];
 }
 

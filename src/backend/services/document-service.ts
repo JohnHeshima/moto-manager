@@ -119,5 +119,8 @@ export function subscribeToDriverDocuments(
             .sort((a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime());
 
         callback(documents);
+    }, (error) => {
+        console.error("Error subscribing to driver documents:", error);
+        callback([]);
     });
 }

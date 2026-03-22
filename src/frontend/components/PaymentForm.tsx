@@ -74,6 +74,14 @@ export default function PaymentForm({ onSuccess, initialData, drivers = [] }: Pa
         : Boolean(rangeLastAllocation && rangeLastAllocation.shortfall > 0);
     const isRangeSubmissionBlocked = activePaymentType === "range" && (!rangePlan || !rangePlan.isValid);
 
+    if (!isAdmin) {
+        return (
+            <div className="rounded-[28px] border border-black/10 bg-card p-5 text-sm text-muted-foreground shadow-[0_12px_35px_rgba(0,0,0,0.06)]">
+                Les motards ne peuvent pas créer ni modifier les versements.
+            </div>
+        );
+    }
+
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!amount) return;

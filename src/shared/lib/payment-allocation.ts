@@ -1,4 +1,5 @@
 const DAY_IN_MS = 24 * 60 * 60 * 1000;
+export const SURPLUS_REGULARIZATION_THRESHOLD = 200000;
 
 export type PaymentType = "weekly" | "range";
 
@@ -22,6 +23,18 @@ export interface PaymentRangePlan {
     validationMessage?: string;
 }
 
+export interface PaymentSurplusRegularizationPlan {
+    periodStart: Date;
+    periodEnd: Date;
+    weekCount: number;
+    allocations: PaymentRangeAllocation[];
+    sourceSurplus: number;
+    carriedSurplus: number;
+    requiresRegularization: boolean;
+    isValid: boolean;
+    validationMessage?: string;
+}
+
 function atMidday(date: Date) {
     return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12, 0, 0, 0);
 }
@@ -30,6 +43,22 @@ function addDays(date: Date, days: number) {
     const result = new Date(date);
     result.setDate(result.getDate() + days);
     return result;
+}
+
+export function getWeeklySurplus(amount: number, targetAmount: number) {
+    return Math.max(0, amount - targetAmount);
+}
+
+export function shouldRegularizeWeeklySurplus({
+    amount,
+    targetAmount,
+    surplusThreshold = SURPLUS_REGULARIZATION_THRESHOLD,
+}: {
+    amount: number;
+    targetAmount: number;
+    surplusThreshold?: number;
+}) {
+    return getWeeklySurplus(amount, targetAmount) >= surplusThreshold;
 }
 
 function getInclusiveDayCount(startDate: Date, endDate: Date) {
@@ -119,6 +148,90 @@ export function buildPaymentRangePlan({
         minimumAmountForLastWeekCarry,
         allocations,
         lastWeekAmount,
+        isValid: true,
+    };
+}
+
+export function buildSurplusRegularizationPlan({
+    startDate,
+    totalAmount,
+    targetAmount,
+    surplusThreshold = SURPLUS_REGULARIZATION_THRESHOLD,
+}: {
+    startDate: Date;
+    totalAmount: number;
+    targetAmount: number;
+    surplusThreshold?: number;
+}): PaymentSurplusRegularizationPlan {
+    const normalizedStartDate = atMidday(startDate);
+
+    if (Number.isNaN(normalizedStartDate.getTime())) {
+        return {
+            periodStart: normalizedStartDate,
+            periodEnd: normalizedStartDate,
+            weekCount: 0,
+            allocations: [],
+            sourceSurplus: 0,
+            carriedSurplus: 0,
+            requiresRegularization: false,
+            isValid: false,
+            validationMessage: "La semaine de départ est invalide.",
+        };
+    }
+
+    if (targetAmount <= 0 || totalAmount <= 0) {
+        return {
+            periodStart: normalizedStartDate,
+            periodEnd: normalizedStartDate,
+            weekCount: 0,
+            allocations: [],
+            sourceSurplus: 0,
+            carriedSurplus: 0,
+            requiresRegularization: false,
+            isValid: false,
+            validationMessage: "Les montants du paiement sont invalides.",
+        };
+    }
+
+    const sourceSurplus = getWeeklySurplus(totalAmount, targetAmount);
+    const requiresRegularization = sourceSurplus >= surplusThreshold;
+    const fullCoveredWeeks = Math.floor(totalAmount / targetAmount);
+    const weekCount = Math.max(1, fullCoveredWeeks);
+    const carriedSurplus = fullCoveredWeeks > 0
+        ? Math.max(0, totalAmount - (fullCoveredWeeks * targetAmount))
+        : sourceSurplus;
+    const allocations: PaymentRangeAllocation[] = [];
+
+    for (let index = 0; index < weekCount; index += 1) {
+        const start = addDays(normalizedStartDate, index * 7);
+        const end = addDays(start, 6);
+        const isLastWeek = index === weekCount - 1;
+        const amount = fullCoveredWeeks > 0
+            ? targetAmount + (isLastWeek ? carriedSurplus : 0)
+            : totalAmount;
+        const shortfall = Math.max(0, targetAmount - amount);
+        const surplus = Math.max(0, amount - targetAmount);
+
+        allocations.push({
+            index: index + 1,
+            startDate: start,
+            endDate: end,
+            weekStart: start,
+            amount,
+            targetAmount,
+            shortfall,
+            surplus,
+        });
+    }
+
+    return {
+        periodStart: normalizedStartDate,
+        periodEnd: addDays(normalizedStartDate, (weekCount * 7) - 1),
+        weekCount,
+        allocations,
+        sourceSurplus,
+        carriedSurplus,
+        requiresRegularization,
         isValid: true,
     };
 }

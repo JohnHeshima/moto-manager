@@ -10,11 +10,128 @@ import {
     doc,
     writeBatch
 } from "firebase/firestore";
-import { db } from "@/backend/firebase/firebase";
-import { Comment, Payment, WeeklyStats } from "@/shared/types";
-import { buildPaymentRangePlan } from "@/shared/lib/payment-allocation";
+import { auth, db } from "@/backend/firebase/firebase";
+import { Comment, DriverOption, Payment, WeeklyStats } from "@/shared/types";
+import {
+    buildPaymentRangePlan,
+    buildSurplusRegularizationPlan,
+    shouldRegularizeWeeklySurplus,
+} from "@/shared/lib/payment-allocation";
 
 const PAYMENTS_COLLECTION = "payments";
+const USERS_COLLECTION = "users";
+const LEGACY_ADMIN_EMAIL = "admin@gmail.com";
+
+function isManagerRole(role?: DriverOption["role"]) {
+    return role === "admin" || role === "co_manager";
+}
+
+function buildFallbackActorProfile(currentUser: NonNullable<typeof auth.currentUser>): DriverOption | null {
+    if (currentUser.email?.toLowerCase() !== LEGACY_ADMIN_EMAIL) {
+        return null;
+    }
+
+    return {
+        uid: currentUser.uid,
+        email: currentUser.email || LEGACY_ADMIN_EMAIL,
+        role: "admin",
+        displayName: currentUser.displayName || "Admin System",
+    };
+}
+
+async function getCurrentActor() {
+    const currentUser = auth.currentUser;
+
+    if (!currentUser) {
+        throw new Error("Authentification requise.");
+    }
+
+    const profileSnapshot = await getDoc(doc(db, USERS_COLLECTION, currentUser.uid));
+
+    if (!profileSnapshot.exists()) {
+        const fallbackProfile = buildFallbackActorProfile(currentUser);
+
+        if (fallbackProfile) {
+            return {
+                currentUser,
+                profile: fallbackProfile,
+            };
+        }
+
+        throw new Error("Profil utilisateur introuvable.");
+    }
+
+    return {
+        currentUser,
+        profile: {
+            ...(profileSnapshot.data() as DriverOption),
+            uid: currentUser.uid,
+        },
+    };
+}
+
+async function requireManagerAccess() {
+    const actor = await getCurrentActor();
+
+    if (!isManagerRole(actor.profile.role)) {
+        throw new Error("Action réservée à l'administration.");
+    }
+
+    return actor;
+}
+
+async function requireOwnUnsignedDriverPayment(paymentId: string) {
+    const actor = await getCurrentActor();
+
+    if (actor.profile.role !== "driver") {
+        throw new Error("Action réservée au motard concerné.");
+    }
+
+    const paymentRef = doc(db, PAYMENTS_COLLECTION, paymentId);
+    const paymentSnapshot = await getDoc(paymentRef);
+
+    if (!paymentSnapshot.exists()) {
+        throw new Error("Paiement introuvable.");
+    }
+
+    const paymentData = paymentSnapshot.data() as Payment;
+
+    if (paymentData.driverId !== actor.currentUser.uid) {
+        throw new Error("Paiement non autorisé.");
+    }
+
+    if (paymentData.driverSignature) {
+        throw new Error("Ce paiement est déjà signé.");
+    }
+
+    return { paymentRef };
+}
+
+async function requireOwnPaymentCommentAccess(paymentId: string) {
+    const actor = await getCurrentActor();
+
+    if (isManagerRole(actor.profile.role)) {
+        return actor;
+    }
+
+    if (actor.profile.role !== "driver") {
+        throw new Error("Action non autorisee.");
+    }
+
+    const paymentSnapshot = await getDoc(doc(db, PAYMENTS_COLLECTION, paymentId));
+
+    if (!paymentSnapshot.exists()) {
+        throw new Error("Paiement introuvable.");
+    }
+
+    const paymentData = paymentSnapshot.data() as Payment;
+
+    if (paymentData.driverId !== actor.currentUser.uid) {
+        throw new Error("Paiement non autorise.");
+    }
+
+    return actor;
+}
 
 export const addPayment = async (
     amount: number,
@@ -27,8 +144,10 @@ export const addPayment = async (
     customDate?: Date
 ) => {
     try {
+        await requireManagerAccess();
+
         const shortfall = Math.max(0, targetAmount - amount);
-        const status = shortfall === 0 ? 'full' : (amount > targetAmount ? 'excess' : 'partial');
+        const status = getPaymentStatus(amount, targetAmount);
 
         const paymentDate = customDate ? Timestamp.fromDate(customDate) : Timestamp.now();
         const dateObj = customDate || new Date();
@@ -62,7 +181,13 @@ export const subscribeToPayments = (
     limitCount = 50,
     selectedDriverId?: string
 ) => {
-    const q = query(collection(db, PAYMENTS_COLLECTION)); // Base query
+    let q = query(collection(db, PAYMENTS_COLLECTION));
+
+    if (selectedDriverId) {
+        q = query(collection(db, PAYMENTS_COLLECTION), where("driverId", "==", selectedDriverId));
+    } else if (role === 'driver' && userId) {
+        q = query(collection(db, PAYMENTS_COLLECTION), where("driverId", "==", userId));
+    }
 
     // We will apply client-side filtering for isDeleted and driverId/Role to avoid complex index requirements for this MVP
     // If data grows, we must add proper composite indexes.
@@ -82,13 +207,6 @@ export const subscribeToPayments = (
         payments = payments.filter(p => !p.isDeleted);
         payments = payments.filter(p => p.paymentType !== "range_item");
 
-        // Admin/co-manager can force a specific driver filter from the UI.
-        if (selectedDriverId) {
-            payments = payments.filter(p => p.driverId === selectedDriverId);
-        } else if (role === 'driver' && userId) {
-            payments = payments.filter(p => p.driverId === userId);
-        }
-
         // Sort descending
         payments.sort((a, b) => (b.createdAt?.getTime() || 0) - (a.createdAt?.getTime() || 0));
 
@@ -96,6 +214,9 @@ export const subscribeToPayments = (
         payments = payments.slice(0, limitCount);
 
         callback(payments);
+    }, (error) => {
+        console.error("Error subscribing to payments:", error);
+        callback([]);
     });
 };
 
@@ -186,6 +307,14 @@ export const subscribeToStats = (callback: (stats: WeeklyStats) => void, driverI
             },
             history
         });
+    }, (error) => {
+        console.error("Error subscribing to stats:", error);
+        callback({
+            currentWeek: { paid: 0, target: 200000, progress: 0 },
+            career: { totalPaid: 0, startedAt: null },
+            global: { totalSurplus: 0, totalDebt: 0 },
+            history: [],
+        });
     });
 };
 
@@ -209,6 +338,16 @@ function normalizeCommentDate(value: Timestamp | Date | string) {
     return value.toDate();
 }
 
+function getPaymentStatus(amount: number, targetAmount: number) {
+    const shortfall = Math.max(0, targetAmount - amount);
+
+    if (shortfall > 0) {
+        return "partial" as const;
+    }
+
+    return amount > targetAmount ? "excess" as const : "full" as const;
+}
+
 // verifying export
 export const updatePayment = async (
     id: string,
@@ -219,8 +358,10 @@ export const updatePayment = async (
     reason?: string
 ) => {
     try {
+        await requireManagerAccess();
+
         const shortfall = Math.max(0, targetAmount - amount);
-        const status = shortfall === 0 ? 'full' : (amount > targetAmount ? 'excess' : 'partial');
+        const status = getPaymentStatus(amount, targetAmount);
 
         const { doc, updateDoc } = await import("firebase/firestore");
 
@@ -243,6 +384,7 @@ export const updatePayment = async (
 
 export const deletePayment = async (id: string, adminId: string) => {
     try {
+        const actor = await requireManagerAccess();
         const paymentRef = doc(db, PAYMENTS_COLLECTION, id);
         const paymentSnapshot = await getDoc(paymentRef);
 
@@ -255,7 +397,7 @@ export const deletePayment = async (id: string, adminId: string) => {
         batch.update(paymentRef, {
             isDeleted: true,
             deletedAt,
-            deletedBy: adminId
+            deletedBy: actor.currentUser.uid || adminId
         });
 
         const paymentData = paymentSnapshot.data() as Payment;
@@ -286,6 +428,8 @@ export const addPaymentComment = async (
     comment: { text: string; authorId: string; authorName: string }
 ) => {
     try {
+        await requireOwnPaymentCommentAccess(paymentId);
+
         const { doc, updateDoc, arrayUnion, Timestamp } = await import("firebase/firestore");
         const newComment = {
             id: Math.random().toString(36).substr(2, 9),
@@ -305,8 +449,9 @@ export const addPaymentComment = async (
 
 export const updateDriverSignature = async (paymentId: string, signature: string) => {
     try {
-        const { doc, updateDoc } = await import("firebase/firestore");
-        await updateDoc(doc(db, PAYMENTS_COLLECTION, paymentId), {
+        const { paymentRef } = await requireOwnUnsignedDriverPayment(paymentId);
+        const { updateDoc } = await import("firebase/firestore");
+        await updateDoc(paymentRef, {
             driverSignature: signature
         });
         return true;
@@ -335,17 +480,28 @@ export const subscribeToPayment = (id: string, callback: (payment: Payment | nul
         } else {
             callback(null);
         }
+    }, (error) => {
+        console.error("Error subscribing to payment:", error);
+        callback(null);
     });
 };
 
 export const subscribeToChildPayments = (
     parentPaymentId: string,
-    callback: (payments: Payment[]) => void
+    callback: (payments: Payment[]) => void,
+    userId?: string,
+    role?: string
 ) => {
-    const childPaymentsQuery = query(
-        collection(db, PAYMENTS_COLLECTION),
-        where("parentPaymentId", "==", parentPaymentId)
-    );
+    const childPaymentsQuery = role === "driver" && userId
+        ? query(
+            collection(db, PAYMENTS_COLLECTION),
+            where("parentPaymentId", "==", parentPaymentId),
+            where("driverId", "==", userId)
+        )
+        : query(
+            collection(db, PAYMENTS_COLLECTION),
+            where("parentPaymentId", "==", parentPaymentId)
+        );
 
     return onSnapshot(childPaymentsQuery, (snapshot) => {
         const childPayments = snapshot.docs
@@ -372,6 +528,9 @@ export const subscribeToChildPayments = (
             });
 
         callback(childPayments);
+    }, (error) => {
+        console.error("Error subscribing to child payments:", error);
+        callback([]);
     });
 };
 
@@ -397,6 +556,8 @@ export const addPaymentRange = async ({
     endDate: Date;
 }) => {
     try {
+        await requireManagerAccess();
+
         const paymentPlan = buildPaymentRangePlan({
             startDate,
             endDate,
@@ -418,9 +579,7 @@ export const addPaymentRange = async ({
         const createdAt = Timestamp.now();
         const parentTargetAmount = paymentPlan.weekCount * targetAmount;
         const parentShortfall = Math.max(0, parentTargetAmount - totalAmount);
-        const parentStatus = parentShortfall === 0
-            ? (totalAmount > parentTargetAmount ? "excess" : "full")
-            : "partial";
+        const parentStatus = getPaymentStatus(totalAmount, parentTargetAmount);
         const batch = writeBatch(db);
 
         batch.set(parentPaymentRef, {
@@ -444,9 +603,7 @@ export const addPaymentRange = async ({
         });
 
         paymentPlan.allocations.forEach((allocation) => {
-            const status = allocation.shortfall === 0
-                ? (allocation.amount > allocation.targetAmount ? "excess" : "full")
-                : "partial";
+            const status = getPaymentStatus(allocation.amount, allocation.targetAmount);
             const childPaymentRef = doc(paymentsCollection);
 
             batch.set(childPaymentRef, {
@@ -481,16 +638,14 @@ export const addPaymentRange = async ({
     }
 };
 
-export const convertPaymentToRange = async ({
+export const regularizePaymentSurplus = async ({
     paymentId,
-    startDate,
-    endDate,
 }: {
     paymentId: string;
-    startDate: Date;
-    endDate: Date;
 }) => {
     try {
+        await requireManagerAccess();
+
         const paymentRef = doc(db, PAYMENTS_COLLECTION, paymentId);
         const paymentSnapshot = await getDoc(paymentRef);
 
@@ -499,54 +654,64 @@ export const convertPaymentToRange = async ({
         }
 
         const paymentData = paymentSnapshot.data() as Payment;
+        const rawPaymentData = paymentSnapshot.data();
         const targetAmount = paymentData.targetAmount || 200000;
-        const paymentPlan = buildPaymentRangePlan({
+        const startDate = (rawPaymentData.weekStart as Timestamp | undefined)?.toDate?.()
+            || getWeekStartDate((rawPaymentData.date as Timestamp | undefined)?.toDate?.() || new Date());
+
+        if (!shouldRegularizeWeeklySurplus({
+            amount: paymentData.amount,
+            targetAmount,
+        })) {
+            throw new Error("Ce versement n'a pas besoin de regularisation.");
+        }
+
+        const paymentPlan = buildSurplusRegularizationPlan({
             startDate,
-            endDate,
             totalAmount: paymentData.amount,
             targetAmount,
         });
 
-        if (!paymentPlan.isValid) {
-            throw new Error(paymentPlan.validationMessage || "Conversion impossible.");
+        if (!paymentPlan.isValid || !paymentPlan.requiresRegularization) {
+            throw new Error(paymentPlan.validationMessage || "Regularisation impossible.");
         }
 
         const intervalGroupId = typeof crypto !== "undefined" && "randomUUID" in crypto
             ? crypto.randomUUID()
-            : `range-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            : `regularize-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const paymentsCollection = collection(db, PAYMENTS_COLLECTION);
-        const periodStartTimestamp = Timestamp.fromDate(startDate);
-        const periodEndTimestamp = Timestamp.fromDate(endDate);
-        const createdAt = paymentSnapshot.data().createdAt || Timestamp.now();
+        const periodStartTimestamp = Timestamp.fromDate(paymentPlan.periodStart);
+        const periodEndTimestamp = Timestamp.fromDate(paymentPlan.periodEnd);
+        const createdAt = (rawPaymentData.createdAt as Timestamp | undefined) || Timestamp.now();
         const parentTargetAmount = paymentPlan.weekCount * targetAmount;
-        const parentShortfall = Math.max(0, parentTargetAmount - paymentData.amount);
-        const parentStatus = parentShortfall === 0
-            ? (paymentData.amount > parentTargetAmount ? "excess" : "full")
-            : "partial";
+        const parentShortfall = 0;
+        const parentStatus = paymentPlan.carriedSurplus > 0 ? "excess" : "full";
         const batch = writeBatch(db);
 
         batch.update(paymentRef, {
             paymentType: "range_parent",
+            regularizationType: "surplus_spread",
             targetAmount: parentTargetAmount,
             shortfall: parentShortfall,
             status: parentStatus,
             date: periodStartTimestamp,
-            weekStart: Timestamp.fromDate(getWeekStartDate(startDate)),
+            weekStart: Timestamp.fromDate(getWeekStartDate(paymentPlan.periodStart)),
             periodStart: periodStartTimestamp,
             periodEnd: periodEndTimestamp,
             allocationCount: paymentPlan.weekCount,
             intervalGroupId,
+            regularizedSurplus: paymentPlan.sourceSurplus,
+            carriedSurplus: paymentPlan.carriedSurplus,
             updatedAt: Timestamp.now(),
         });
 
         paymentPlan.allocations.forEach((allocation) => {
-            const status = allocation.shortfall === 0
-                ? (allocation.amount > allocation.targetAmount ? "excess" : "full")
-                : "partial";
+            const status = getPaymentStatus(allocation.amount, allocation.targetAmount);
             const childPaymentRef = doc(paymentsCollection);
 
             batch.set(childPaymentRef, {
                 paymentType: "range_item",
+                regularizationType: "surplus_spread",
                 parentPaymentId: paymentId,
                 amount: allocation.amount,
                 targetAmount: allocation.targetAmount,
@@ -564,6 +729,8 @@ export const convertPaymentToRange = async ({
                 allocationIndex: allocation.index,
                 allocationCount: paymentPlan.weekCount,
                 intervalGroupId,
+                regularizedSurplus: allocation.surplus,
+                carriedSurplus: allocation.surplus,
                 createdAt,
             });
         });
@@ -571,7 +738,7 @@ export const convertPaymentToRange = async ({
         await batch.commit();
         return true;
     } catch (error) {
-        console.error("Error converting payment to range:", error);
+        console.error("Error regularizing payment surplus:", error);
         return false;
     }
 };

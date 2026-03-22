@@ -15,9 +15,25 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
     }
 
+    function isLegacyAdmin() {
+      return isSignedIn()
+        && request.auth.token.email == "admin@gmail.com";
+    }
+
     function isManager() {
-      return hasUserProfile()
-        && (currentUserRole() == "admin" || currentUserRole() == "co_manager");
+      return isAdmin() || isCoManager();
+    }
+
+    function isAdmin() {
+      return isLegacyAdmin()
+        || (
+          hasUserProfile()
+          && currentUserRole() == "admin"
+        );
+    }
+
+    function isCoManager() {
+      return hasUserProfile() && currentUserRole() == "co_manager";
     }
 
     function isDriver() {
@@ -43,6 +59,16 @@ service cloud.firestore {
         && request.resource.data.role == resource.data.role;
     }
 
+    function isCoManagerVisibleUser(userId) {
+      return isCoManager() && (isSelf(userId) || resource.data.role == "driver");
+    }
+
+    function isCoManagerDriverCreate(userId) {
+      return isCoManager()
+        && request.resource.data.uid == userId
+        && request.resource.data.role == "driver";
+    }
+
     function isValidDriverSignatureUpdate() {
       return isDriver()
         && isOwnPayment()
@@ -52,19 +78,26 @@ service cloud.firestore {
         && request.resource.data.driverSignature != "";
     }
 
+    function isValidOwnPaymentCommentUpdate() {
+      return isDriver()
+        && isOwnPayment()
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["comments"])
+        && request.resource.data.comments is list;
+    }
+
     match /users/{userId} {
-      allow get: if isManager() || isSelf(userId);
-      allow list: if isManager();
-      allow create: if isManager();
-      allow update: if isManager() || isSelfProfileUpdate(userId);
-      allow delete: if isManager();
+      allow get: if isAdmin() || isCoManagerVisibleUser(userId) || isSelf(userId);
+      allow list: if isAdmin() || isCoManagerVisibleUser(userId);
+      allow create: if isAdmin() || isCoManagerDriverCreate(userId);
+      allow update: if isAdmin() || isSelfProfileUpdate(userId);
+      allow delete: if isAdmin();
     }
 
     match /payments/{paymentId} {
       allow get: if isManager() || isOwnPayment();
       allow list: if isManager() || (isDriver() && isOwnPayment());
       allow create: if isManager();
-      allow update: if isManager() || isValidDriverSignatureUpdate();
+      allow update: if isManager() || isValidDriverSignatureUpdate() || isValidOwnPaymentCommentUpdate();
       allow delete: if false;
     }
 

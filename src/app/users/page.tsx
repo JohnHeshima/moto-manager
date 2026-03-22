@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAuth, UserProfile } from "@/frontend/contexts/AuthContext";
 import { db } from "@/backend/firebase/firebase";
-import { collection, getDocs, doc, updateDoc, setDoc, Timestamp, deleteDoc } from "firebase/firestore";
+import { collection, getDocs, doc, getDoc, query, updateDoc, setDoc, Timestamp, deleteDoc, where } from "firebase/firestore";
 import { initializeApp, getApps } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
 import { useRouter } from "next/navigation";
@@ -50,7 +50,9 @@ export default function UsersPage() {
     const [isFetching, setIsFetching] = useState(true);
     const isLegacyAdmin = user?.email?.toLowerCase() === "admin@gmail.com";
     const isAdmin = userProfile?.role === "admin" || isLegacyAdmin;
-    const canManageUsers = isAdmin || userProfile?.role === "co_manager";
+    const isCoManager = userProfile?.role === "co_manager";
+    const canManageUsers = isAdmin || isCoManager;
+    const canCreateOnlyDrivers = isCoManager && !isAdmin;
 
     // New User Form State
     const [showCreateForm, setShowCreateForm] = useState(false);
@@ -60,6 +62,62 @@ export default function UsersPage() {
     const [newUserRole, setNewUserRole] = useState<"admin" | "driver" | "co_manager">("driver");
     const [isCreating, setIsCreating] = useState(false);
     const [createError, setCreateError] = useState("");
+
+    const fetchUsers = useCallback(async () => {
+        try {
+            if (!user) {
+                setUsers([]);
+                return;
+            }
+
+            let rawUsers: UserWithCreatedAt[] = [];
+
+            if (isAdmin) {
+                const snapshot = await getDocs(collection(db, "users"));
+                rawUsers = snapshot.docs.map((userDoc) => ({ uid: userDoc.id, ...userDoc.data() } as UserWithCreatedAt));
+            } else if (isCoManager) {
+                const [selfSnapshot, driversSnapshot] = await Promise.all([
+                    getDoc(doc(db, "users", user.uid)),
+                    getDocs(query(collection(db, "users"), where("role", "==", "driver"))),
+                ]);
+
+                const visibleUsers: UserWithCreatedAt[] = [];
+
+                if (selfSnapshot.exists()) {
+                    visibleUsers.push({ uid: selfSnapshot.id, ...selfSnapshot.data() } as UserWithCreatedAt);
+                }
+
+                driversSnapshot.docs.forEach((userDoc) => {
+                    visibleUsers.push({ uid: userDoc.id, ...userDoc.data() } as UserWithCreatedAt);
+                });
+
+                const dedupedUsers = new Map<string, UserWithCreatedAt>();
+                visibleUsers.forEach((profile) => {
+                    dedupedUsers.set(profile.uid, profile);
+                });
+                rawUsers = Array.from(dedupedUsers.values());
+            }
+
+            const userData = rawUsers
+                .sort((a, b) => {
+                    const aCreatedAt = a.createdAt?.toDate?.().getTime() || 0;
+                    const bCreatedAt = b.createdAt?.toDate?.().getTime() || 0;
+                    return bCreatedAt - aCreatedAt;
+                })
+                .map((profile) => ({
+                    uid: profile.uid,
+                    email: profile.email,
+                    displayName: profile.displayName,
+                    role: profile.role,
+                }));
+
+            setUsers(userData);
+        } catch (error) {
+            console.error("Error fetching users:", error);
+        } finally {
+            setIsFetching(false);
+        }
+    }, [isAdmin, isCoManager, user]);
 
     useEffect(() => {
         if (!loading && !user) {
@@ -75,31 +133,7 @@ export default function UsersPage() {
         if (!loading && user && canManageUsers) {
             fetchUsers();
         }
-    }, [user, loading, canManageUsers, router]);
-
-    const fetchUsers = async () => {
-        try {
-            const snapshot = await getDocs(collection(db, "users"));
-            const userData = snapshot.docs
-                .map((userDoc) => ({ uid: userDoc.id, ...userDoc.data() } as UserWithCreatedAt))
-                .sort((a, b) => {
-                    const aCreatedAt = a.createdAt?.toDate?.().getTime() || 0;
-                    const bCreatedAt = b.createdAt?.toDate?.().getTime() || 0;
-                    return bCreatedAt - aCreatedAt;
-                })
-                .map((profile) => ({
-                    uid: profile.uid,
-                    email: profile.email,
-                    displayName: profile.displayName,
-                    role: profile.role,
-                }));
-            setUsers(userData);
-        } catch (error) {
-            console.error("Error fetching users:", error);
-        } finally {
-            setIsFetching(false);
-        }
-    };
+    }, [user, loading, canManageUsers, router, fetchUsers]);
 
     const handleCreateUser = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -107,6 +141,8 @@ export default function UsersPage() {
         setCreateError("");
 
         try {
+            const roleToCreate = canCreateOnlyDrivers ? "driver" : newUserRole;
+
             // 1. Create User in Auth (Secondary App)
             const userCredential = await createUserWithEmailAndPassword(secondaryAuth, newUserEmail, newUserPassword);
             const newUser = userCredential.user;
@@ -118,7 +154,7 @@ export default function UsersPage() {
                 uid: newUser.uid,
                 email: newUser.email || newUserEmail,
                 displayName: newUserName,
-                role: newUserRole,
+                role: roleToCreate,
                 createdAt: Timestamp.now()
             };
 
@@ -204,15 +240,15 @@ export default function UsersPage() {
                 </div>
             </div>
 
-            {isAdmin && (
+            {canManageUsers && (
                 <div className="bg-card border border-border/60 rounded-xl p-4 shadow-sm">
                     {!showCreateForm ? (
                         <Button onClick={() => setShowCreateForm(true)} className="w-full">
-                            <Plus className="mr-2 h-4 w-4" /> Ajouter un Utilisateur
+                            <Plus className="mr-2 h-4 w-4" /> {canCreateOnlyDrivers ? "Ajouter un Motard" : "Ajouter un Utilisateur"}
                         </Button>
                     ) : (
                         <form onSubmit={handleCreateUser} className="space-y-4 animate-in fade-in zoom-in-95">
-                            <h3 className="font-semibold text-lg">Nouvel Utilisateur</h3>
+                            <h3 className="font-semibold text-lg">{canCreateOnlyDrivers ? "Nouveau Motard" : "Nouvel Utilisateur"}</h3>
                             <div className="space-y-2">
                                 <Label>Nom Complet</Label>
                                 <Input value={newUserName} onChange={e => setNewUserName(e.target.value)} required placeholder="Ex: Jean Motard" />
@@ -227,26 +263,35 @@ export default function UsersPage() {
                                     <PasswordInput value={newUserPassword} onChange={e => setNewUserPassword(e.target.value)} required minLength={6} placeholder="******" />
                                 </div>
                             </div>
-                            <div className="space-y-2">
-                                <Label>Rôle</Label>
-                                <Select
-                                    value={newUserRole}
-                                    onValueChange={(value) => {
-                                        if (isUserRole(value)) {
-                                            setNewUserRole(value);
-                                        }
-                                    }}
-                                >
-                                    <SelectTrigger>
-                                        <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        <SelectItem value="driver">Motard</SelectItem>
-                                        <SelectItem value="co_manager">Co-Gérant</SelectItem>
-                                        <SelectItem value="admin">Administrateur</SelectItem>
-                                    </SelectContent>
-                                </Select>
-                            </div>
+                            {isAdmin ? (
+                                <div className="space-y-2">
+                                    <Label>Rôle</Label>
+                                    <Select
+                                        value={newUserRole}
+                                        onValueChange={(value) => {
+                                            if (isUserRole(value)) {
+                                                setNewUserRole(value);
+                                            }
+                                        }}
+                                    >
+                                        <SelectTrigger>
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="driver">Motard</SelectItem>
+                                            <SelectItem value="co_manager">Co-Gérant</SelectItem>
+                                            <SelectItem value="admin">Administrateur</SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                            ) : (
+                                <div className="space-y-2">
+                                    <Label>Rôle</Label>
+                                    <div className="rounded-xl border border-border/60 bg-muted/40 px-3 py-2 text-sm font-medium text-foreground">
+                                        Motard
+                                    </div>
+                                </div>
+                            )}
 
                             {createError && <p className="text-sm text-rose-500 font-medium">{createError}</p>}
 

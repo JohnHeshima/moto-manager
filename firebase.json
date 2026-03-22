@@ -1,0 +1,22 @@
+{
+    "firestore": [
+        {
+            "database": "driver-payment-manager-dev",
+            "rules": "firestore.dev.rules"
+        }
+    ],
+    "storage": {
+        "rules": "storage.rules"
+    },
+    "hosting": {
+        "source": ".",
+        "ignore": [
+            "firebase.json",
+            "**/.*",
+            "**/node_modules/**"
+        ],
+        "frameworksBackend": {
+            "region": "us-central1"
+        }
+    }
+}

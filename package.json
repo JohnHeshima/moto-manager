@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "firestore:copy-db": "node scripts/copy-firestore-database.mjs"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.8",
